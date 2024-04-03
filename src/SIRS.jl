@@ -1,5 +1,6 @@
 module SIRS
 
+    using CUDA           # GPU - Currently used only for JWST cosmic rays.
     using Dates          # Time functions
     using Dierckx        # Interpolation
     using FITSIO         # FITS files
@@ -55,11 +56,13 @@ module SIRS
     export solve!              # SIRS solve for alpha and beta from SIRSCore 
     export inc_rfft            # Incomplete Fourier transform
     export wplot               # Plot SIRS weights
+    export CRFix, crfix        # Cosmic rays tools
 
     include("LegendreMatrices.jl")
     include("SIRSCore.jl")
     # include("inc_rfft_pars.jl")
     include("adapt_sirssub.jl")
+    include("cosmic_rays.jl")
     include("chsuf.jl")
     include("clear!.jl")
     include("coadd!.jl")
