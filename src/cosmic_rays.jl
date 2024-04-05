@@ -115,8 +115,9 @@ function crfix(F::CRFix, D::CuArray{Float32,3}; init::Bool=true)
     
     #= ***** This section should be revisited some day. Julia's CUDA package *****
     does not provide a GPU-enabled partialpermsort. Do it in the CPUs.
-    This slows things down. =#
+    This slows things down.
     
+    # CPU version
     # Find hit frame indices. Fix only biggest hits per pixel.
     _J = Array(J) # Download to CPU
     J_z = Matrix{Int32}(undef, (128,128)) # Frame indices of hits go here
@@ -131,13 +132,22 @@ function crfix(F::CRFix, D::CuArray{Float32,3}; init::Bool=true)
 
     # Find hit amplitudes
     J_amp = dropdims(maximum(J, dims=3), dims=3)
-    # ***** END CPU CODE *****
     
-    # Fix hits
+    # Fix
     for _z in 1:nz
-        M = _z .== J_z                         # Mask of pixels to fix in this frame
+        M = _z .== J_z                       # Mask of pixels to fix in this frame
         D[M,_z:nz] .= D[M,_z:nz] .- J_amp[M] # Fix
     end
+    # ***** END CPU CODE ***** =#
+    
+    # ***** BEGIN PURE GPU VERSION *****  
+    # Cosmic rays are the maximum jump in each pixel
+    J_amp = dropdims(maximum(J, dims=3), dims=3)
+    for _z in 1:nz
+        M = (J[:,:,_z] .== J_amp) .& (J_amp .> F.j_min) # Mask of pixels to fix in next frame
+        D[M,_z+1:nz] .= D[M,_z+1:nz] .- J_amp[M] # Fix
+    end   
+    # ***** END PURE GPU VERSION
     
     # Done
     return(D)
