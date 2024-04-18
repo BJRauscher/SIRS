@@ -56,18 +56,21 @@ module SIRS
     export solve!              # SIRS solve for alpha and beta from SIRSCore 
     export inc_rfft            # Incomplete Fourier transform
     export wplot               # Plot SIRS weights
-    export CRFix, crfix        # Cosmic rays tools
+
+    # JWST NIRCam package
+    export nircam_rowcor, h5write, CRFix, crfix, xitr, cumedian, NIRCam_SIRS,
+            nircam_sirs_coadd!, nircam_sirs_solve, apply_sirs
 
     include("LegendreMatrices.jl")
     include("SIRSCore.jl")
     # include("inc_rfft_pars.jl")
     include("adapt_sirssub.jl")
-    include("cosmic_rays.jl")
     include("chsuf.jl")
     include("clear!.jl")
     include("coadd!.jl")
     include("export_to_sirspy.jl")
     include("get_file_list.jl")
+    include("JWST.jl")
     include("legfit.jl")
     include("legval.jl")
     include("restore.jl")
