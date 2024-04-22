@@ -600,7 +600,7 @@ end
 
 
 """
-    apply_sirs(fits_filename; sirs_file=nothing, zrng=:, irng=:)
+    apply_sirs(fits_filename; sirs_file=nothing, zrng=:, irng=:, rolloff=(4,8))
 
 Apply SIRS to JWST NIRCam FITS file. 
 
@@ -616,6 +616,9 @@ Apply SIRS to JWST NIRCam FITS file.
                 irng
                   Range of integrations to read in and apply SIRS correction to. The default
                   reads all integrations.
+                rolloff
+                  Roll alpha and beta from 1x gain to 0x gain over this range of
+                  frequencies. This function uses a raised cosine to do the rolloff.
        Returns: The SIRS corrected data.
 
     Notes:
@@ -642,7 +645,8 @@ Apply SIRS to JWST NIRCam FITS file.
        On Intel machines, this is usually MKL_NUM_THREADs. On other machines, it is often
        OPM_NUM_THREADS.
 """
-function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
+function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
+    rolloff::Tuple{<:Number, <:Number}=(4,8))
     
     # Definitions
     nx,ny = 2048,2048 # Size of H2RG detector in pixels
@@ -683,10 +687,9 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     #= For NIRCam, the reference columns are very sparsely sampled compared to the normal pixels.
     After only a few Hertz, white read noise becomes more important than 1/f noise. To avoid adding
     a small read noise penalty, roll the SIRS gamma and zeta off starting at a few Hertz using a raised
-    cosine function. The specific shape of the roll-off needs more work. For now I am starting the
-    rolloff at 4 Hz and finishing with 0x gain at 8 Hz. =#
-    f_c = 6 # Hz, 1/2 power frequency (baseline=6)
-    λ_ap = 8 # Hz, Cosine apodizer wavelength (baseline=8)
+    cosine function. The specific shape of the roll-off needs more work. =#
+    f_c = (rolloff[1]+rolloff[2])/2 # Hz, 1/2 power frequency
+    λ_ap = 2(rolloff[2]-rolloff[1]) # Hz, Cosine apodizer wavelength (baseline=8)
     k = 2π/λ_ap
     cosine_rolloff = 0.5*(1 .+ cos.(k*(rfftfreq .- 4)))
     cosine_rolloff[rfftfreq .< f_c-λ_ap/4] .= 1
