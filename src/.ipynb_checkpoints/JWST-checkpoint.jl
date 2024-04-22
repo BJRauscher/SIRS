@@ -64,13 +64,23 @@ Write JWST NIRCam SIRS calibration files.
                   SIRS gamma coefficients
                 ζ
                   SIRS zeta coefficients
+                ps_𝓵
+                  Power spectrum of left reference columns.
+                  The units are DN^2/bin.
+                ps_𝓻
+                  Power spectrum of right reference columns.
+                  The units are DN^2/bin.
+                ps_𝓷
+                  Power spectrum of normal pixels.
+                  The units are DN^2/bin.
                 scss::Vector{String}
                   List of NIRCam Sensor Chip Systems
                 output_filename::String
-                  Write results to this file.
+                  Write results to this file.      
        Returns: This function write a file and exits.
 """
-function h5write(prog_id::String, f::Vector{Float32}, γ, ζ, scss::Vector{String}, output_filename::String)
+function h5write(prog_id::String, f::Vector{Float32}, γ, ζ, 
+        ps_𝓵, ps_𝓻, ps_𝓷, scss::Vector{String}, output_filename::String)
     
     # Open the file. It is closed upon exiting this block.
     h5open(output_filename, "w") do fid
@@ -89,8 +99,12 @@ function h5write(prog_id::String, f::Vector{Float32}, γ, ζ, scss::Vector{Strin
 
         # Save data
         for i in 1:length(scss)
+            # if i !=1; continue; end # STUB
             write_dataset(fid[scss[i]], "gamma", γ[i])
             write_dataset(fid[scss[i]], "zeta", ζ[i])
+            write_dataset(fid[scss[i]], "ps_l", ps_𝓵[i])
+            write_dataset(fid[scss[i]], "ps_r", ps_𝓻[i])
+            write_dataset(fid[scss[i]], "ps_n", ps_𝓷[i])
         end
 
     end
@@ -588,20 +602,45 @@ end
 """
     apply_sirs(fits_filename; sirs_file=nothing, zrng=:, irng=:)
 
-Apply SIRS to JWST NIRCam data. 
+Apply SIRS to JWST NIRCam FITS file. 
 
     Parameters: fits_filename
                   The input filename. SIRS assumes that you have run the JWST pipeline
-                  through the reference correction step. You should have the alternating
-                  column noise correction turned off. You should have use_side_reference_pixels
-                  turned off. 
+                  through the reference correction step. You should have the
+                  use_side_reference_pixels kwarg turned OFF. 
                 sirs_filesname
                   Set this to use a SIRS calibration file that is different from the default.
                 zrng
-                  Range of frames to read in and apply SIRS correction to.
+                  Range of frames to read in and apply SIRS correction to. The default reads
+                  all frames.
                 irng
-                  Range of integrations to read in and apply SIRS correction to.
+                  Range of integrations to read in and apply SIRS correction to. The default
+                  reads all integrations.
        Returns: The SIRS corrected data.
+
+    Notes:
+    *) This is Julia. The algorithm is as follows.
+        1) Read frequency dependent weights, gamma and zeta, in from reference file.
+        2) Apply a low pass filter to gamma and zeta. Use a lifted cosine for the roll-off.
+           The roll-off currently starts at 4 Hz and finishes at 8 Hz. More work is
+           Needed to define the optimal roll-off.
+        3) Read the data from the FITS file. SIRS only works on full-frame data. The
+           data structure potentially has 4 dimensions,
+           (image columns, image rows, resultants, integrations). It simplifies things to 
+           always work with 4th rank data and trim singleton dimensions later.
+        4a) Get the left reference columns, average them (in rows), find statistical
+            outliers, and backfill with local averages.
+        4b) Get the right reference columns, average them (in rows), find statistical
+            outliers, and backfill with local averages.
+        5) Build reference array (for everything in parallel) using Eq. 3 from the SIRS paper.
+        6) Subtract reference array
+        7) Restore shape
+        8) Crop off singleton dimensions.
+    *) This is GPU code. The GPU automatically parallelizes almost all of it. If you are working
+       in python using CPUs, it should be possible to parallelize the linear algebra operations. 
+       To do this, set the appropriate shell environment variable to allow BLAS multithreading.
+       On Intel machines, this is usually MKL_NUM_THREADs. On other machines, it is often
+       OPM_NUM_THREADS.
 """
 function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     
@@ -617,13 +656,15 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
                         "/JWST/Library/SIRS/20240410_sirs_nircam.h5"
     end
     
-    # Use Gauss interpolation to fill outliers
-    μ = ny÷2+1 # Mean is center row
-    σ = 1.5 # Use a narrow Gaussian, 1.5 rows
-    x = CuArray(collect(1:2048)) # x-values for computing Gaussian
-    fK = reshape(rfft(ifftshift(Float32.((1/σ/sqrt(2π)) * exp.(-0.5*((x.-μ)/σ).^2)))), (:,1,1)) # Result shaped to broadcast
+    # Use a Gauss weighted average of neighboring good pixels to fill outliers. Build
+    # the Gaussian kernel here.
+    μ = ny÷2+1 # Mean is center row of detector.
+    σ = 1.5 # Use a narrow Gaussian, 1.5 rows. There are not many bad pixels in the reference columns.
+    x = CuArray(collect(1:2048)) # x-values for computing Gaussian kernel.
+    fK = reshape(rfft(ifftshift(Float32.((1/σ/sqrt(2π)) * exp.(-0.5*((x.-μ)/σ).^2)))), (:,1,1)) # Fourier
+                             # transorm of Gaussian kernel shaped to broadcast.
         
-    # Get necessary information from FITS header
+    # Get some necessary information from FITS header
     detector, ngroups, nints = FITS(fits_filename, "r") do fid
         (
             lowercase(read_key(fid[1], "DETECTOR")[1]),
@@ -639,9 +680,11 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
         CuArray(read(fid[detector])["zeta"]))
     end
     
-    #= There are not enough reference pixels, so the 1/f imprint has a lot
-    of white read noise compared to the regular pixels (See plot in documentation
-    folder). Use 1/2 a cosine function to roll them off over 4-8 Hz. =#
+    #= For NIRCam, the reference columns are very sparsely sampled compared to the normal pixels.
+    After only a few Hertz, white read noise becomes more important than 1/f noise. To avoid adding
+    a small read noise penalty, roll the SIRS gamma and zeta off starting at a few Hertz using a raised
+    cosine function. The specific shape of the roll-off needs more work. For now I am starting the
+    rolloff at 4 Hz and finishing with 0x gain at 8 Hz. =#
     f_c = 6 # Hz, 1/2 power frequency (baseline=6)
     λ_ap = 8 # Hz, Cosine apodizer wavelength (baseline=8)
     k = 2π/λ_ap
@@ -649,8 +692,8 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     cosine_rolloff[rfftfreq .< f_c-λ_ap/4] .= 1
     cosine_rolloff[rfftfreq .> f_c+λ_ap/4] .= 0
     cosine_rolloff = CuArray(Float32.(reshape(cosine_rolloff, (:,1)))) # Reshape to broadcast
-    γ = cosine_rolloff .* γ
-    ζ = cosine_rolloff .* ζ
+    γ = cosine_rolloff .* γ # Roll-off gamma
+    ζ = cosine_rolloff .* ζ # Roll-off zeta
     
     #= We will need to identify outliers in the reference pixels and
     backfill them with something sensible. To find outliers, it will be
@@ -658,7 +701,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     to identify outliers. Here is that filter. =#
     w = CuArray(reshape(sqrt.(rfftfreq ./ (5 .+ rfftfreq)), (:,1)))
     
-    # Get data
+    # Get data from FITS file
     D = FITS(fits_filename, "r") do fid
          CuArray(read(fid[2], :, :, zrng, irng))
     end
@@ -671,7 +714,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     _nx,_ny,nz,ni = size(D) # Capture dimensions
 
     #= ***** BEGIN - Backfill all outliers in left reference columns ***** =#
-    L = irfft(w .* rfft(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), 1), ny, 1) # Get filtering 1/f
+    L = irfft(w .* rfft(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
     μ = median(L)
     σ = 1.4826median(abs.(L.-μ))
     GL = (μ-4sigrej.<=L) .& (L.<=μ+4sigrej)                                        # Good pixel mask
@@ -682,7 +725,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:)
     #= ***** END - Backfill all outliers in left reference columns ***** =#
 
     #= ***** BEGIN - Backfill all outliers in right reference columns ***** =#
-    R = irfft(w .* rfft(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), 1), ny, 1) # Get filtering 1/f
+    R = irfft(w .* rfft(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
     μ = median(R)
     σ = 1.4826median(abs.(R.-μ))
     GR = (μ-4sigrej.<=R) .& (R.<=μ+4sigrej)                                        # Good pixel mask
