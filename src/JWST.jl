@@ -52,13 +52,13 @@ end
 
 
 """
-    h5write(prog_id::String, f::Vector{Float32}, γ, ζ, scss::Vector{String}, output_filename::String)
+    h5write(prog_id, f, γ, ζ, ps_𝓵, ps_𝓻, ps_𝓷, scss, output_filename)
 
 Write JWST NIRCam SIRS calibration files.
 
-    Parameters: prog_id::String
+    Parameters: prog_id
                   JWST Program ID
-                f::Vector{Float32}
+                f
                   Fourier frequencies. 
                 γ
                   SIRS gamma coefficients
@@ -73,9 +73,9 @@ Write JWST NIRCam SIRS calibration files.
                 ps_𝓷
                   Power spectrum of normal pixels.
                   The units are DN^2/bin.
-                scss::Vector{String}
+                scss
                   List of NIRCam Sensor Chip Systems
-                output_filename::String
+                output_filename
                   Write results to this file.      
        Returns: This function write a file and exits.
 """
@@ -544,8 +544,11 @@ end
 function nircam_sirs_solve(F::CRFix, nz::Int64, files::Vector{String})
     
     # Get some necessary information form the first file
-    nints,ngroups = FITS(files[1], "r") do fid
-       (read_key(fid[1], "NINTS")[1], read_key(fid[1], "NGROUPS")[1])
+    nints,ngroups,fastaxis,slowaxis = FITS(files[1], "r") do fid
+       (read_key(fid[1], "NINTS")[1],
+        read_key(fid[1], "NGROUPS")[1],
+        read_key(fid[1], "FASTAXIS")[1],
+        read_key(fid[1], "SLOWAXIS")[1])
     end
     
     # Instantiate a NIRCam SIRS struct. This initializes the SIRS sums for this SCS.
@@ -562,6 +565,14 @@ function nircam_sirs_solve(F::CRFix, nz::Int64, files::Vector{String})
             D = FITS(file, "r") do fid
                 read(fid[2],:,:,:,i)
             end
+            
+            #= Translate to detector coordinates. In detector coordinates,
+            the detector is read out in 4 thick vertical stripes. Fast scan is
+            from left to right in output #1. The slow scan direction is from
+            bottom to top as displayed in SAOImage ds9. =#
+            if abs(fastaxis) != 1; D = permutedims(D, (2,1,3)); end # Make fast axis first
+            if sign(fastaxis) < 0; D = D[end:-1:1,:,:]; end # Flip if necessary
+            if sign(slowaxis) < 0; D = D[:,end:-1:1,:]; end # Flip if necessary
             
             #= Commented out to parallel the pipeline.
             # The Pipeline's rows-only reference correction does not seem
@@ -646,7 +657,7 @@ Apply SIRS to JWST NIRCam FITS file.
        OPM_NUM_THREADS.
 """
 function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
-    rolloff::Tuple{<:Number, <:Number}=(4,8))
+    rolloff::Tuple{<:Number, <:Number}=(0,0))
     
     # Definitions
     nx,ny = 2048,2048 # Size of H2RG detector in pixels
@@ -657,7 +668,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
     # Set defaults
     if sirs_file == ""
         sirs_file = "/explore/nobackup/people/brausche/data"*
-                        "/JWST/Library/SIRS/20240410_sirs_nircam.h5"
+                        "/JWST/Library/SIRS/20240418_sirs_nircam.h5"
     end
     
     # Use a Gauss weighted average of neighboring good pixels to fill outliers. Build
@@ -677,19 +688,23 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
         )
     end
         
-    # Get SIRS frequencies and weights from calibration file
-    rfftfreq,γ,ζ = h5open(sirs_file, "r") do fid
+    # Get SIRS frequencies, weights, and filter definition from calibration file
+    rfftfreq,γ,ζ,filter = h5open(sirs_file, "r") do fid
         (Float32.(read_attribute(fid, "rfftfreq")),
         CuArray(read(fid[detector])["gamma"]),
-        CuArray(read(fid[detector])["zeta"]))
+        CuArray(read(fid[detector])["zeta"]),
+        Float32.(read(fid[detector])["filter"]))
     end
+    
+    # If set, the rolloff kwarg overrides filter
+    if rolloff != (0,0); filter=rolloff; end
     
     #= For NIRCam, the reference columns are very sparsely sampled compared to the normal pixels.
     After only a few Hertz, white read noise becomes more important than 1/f noise. To avoid adding
     a small read noise penalty, roll the SIRS gamma and zeta off starting at a few Hertz using a raised
-    cosine function. The specific shape of the roll-off needs more work. =#
-    f_c = (rolloff[1]+rolloff[2])/2 # Hz, 1/2 power frequency
-    λ_ap = 2(rolloff[2]-rolloff[1]) # Hz, Cosine apodizer wavelength (baseline=8)
+    cosine function. =#
+    f_c = (filter[1]+filter[2])/2 # Hz, 1/2 power frequency
+    λ_ap = 2(filter[2]-filter[1]) # Hz, Cosine apodizer wavelength (baseline=8)
     k = 2π/λ_ap
     cosine_rolloff = 0.5*(1 .+ cos.(k*(rfftfreq .- 4)))
     cosine_rolloff[rfftfreq .< f_c-λ_ap/4] .= 1
@@ -720,7 +735,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
     L = irfft(w .* rfft(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
     μ = median(L)
     σ = 1.4826median(abs.(L.-μ))
-    GL = (μ-4sigrej.<=L) .& (L.<=μ+4sigrej)                                        # Good pixel mask
+    GL = (μ-sigrej*σ.<=L) .& (L.<=μ+sigrej*σ)                                        # Good pixel mask
     L = reshape(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), (ny,:,ni))          # Reload unfiltered L
     L[.! GL] .= 0                                                                  # Mark outliers by setting them =0.
     L_fill = irfft(rfft(L, 1) .* fK, 2048, 1) ./ irfft(rfft(GL, 1) .* fK, 2048, 1) # Compute fill values
@@ -731,7 +746,7 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
     R = irfft(w .* rfft(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
     μ = median(R)
     σ = 1.4826median(abs.(R.-μ))
-    GR = (μ-4sigrej.<=R) .& (R.<=μ+4sigrej)                                        # Good pixel mask
+    GR = (μ-sigrej*σ.<=R) .& (R.<=μ+sigrej*σ)                                        # Good pixel mask
     R = reshape(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), (ny,:,ni))   # Reload unfiltered R
     R[.! GR] .= 0                                                                  # Mark outliers by setting them =0.
     R_fill = irfft(rfft(R, 1) .* fK, 2048, 1) ./ irfft(rfft(GR, 1) .* fK, 2048, 1) # Compute fill values
@@ -756,3 +771,103 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
     
 end
 
+function apply_sirs(detector::String, D::CuArray{Float32,4}; sirs_file::String="")
+    
+    # Definitions
+    nx,ny = 2048,2048 # Size of H2RG detector in pixels
+    nout = 4          # Number of H2RG outputs
+    rb = 4            # Width of reference pixels border
+    sigrej = 4        # Sigma clipping rejection threshold
+        
+    # Set defaults
+    if sirs_file == ""
+        sirs_file = "/explore/nobackup/people/brausche/data"*
+                        "/JWST/Library/SIRS/20240418_sirs_nircam.h5"
+    end
+    
+    # Use a Gauss weighted average of neighboring good pixels to fill outliers. Build
+    # the Gaussian kernel here.
+    μ = ny÷2+1 # Mean is center row of detector.
+    σ = 1.5 # Use a narrow Gaussian, 1.5 rows. There are not many bad pixels in the reference columns.
+    x = CuArray(collect(1:2048)) # x-values for computing Gaussian kernel.
+    fK = reshape(rfft(ifftshift(Float32.((1/σ/sqrt(2π)) * exp.(-0.5*((x.-μ)/σ).^2)))), (:,1,1)) # Fourier
+                             # transorm of Gaussian kernel shaped to broadcast.
+        
+    # Get SIRS frequencies and weights from calibration file
+    rfftfreq,γ,ζ,filter = h5open(sirs_file, "r") do fid
+        (Float32.(read_attribute(fid, "rfftfreq")),
+        CuArray(read(fid[detector])["gamma"]),
+        CuArray(read(fid[detector])["zeta"]),
+        Float32.(read(fid[detector])["filter"]))
+    end
+    
+    #= For NIRCam, the reference columns are very sparsely sampled compared to the normal pixels.
+    After only a few Hertz, white read noise becomes more important than 1/f noise. To avoid adding
+    a small read noise penalty, roll the SIRS gamma and zeta off starting at a few Hertz using a raised
+    cosine function. =#
+    cosine_rolloff = [] # Put results here
+    for i in 1:2:16
+        f_c = (filter[1]+filter[2])/2 # Hz, 1/2 power frequency
+        λ_ap = 2(filter[2]-filter[1]) # Hz, Cosine apodizer wavelength (baseline=8)
+        k = 2π/λ_ap
+        _cosine_rolloff = 0.5*(1 .+ cos.(k*(rfftfreq .- 4)))
+        _cosine_rolloff[rfftfreq .< f_c-λ_ap/4] .= 1
+        _cosine_rolloff[rfftfreq .> f_c+λ_ap/4] .= 0
+        push!(cosine_rolloff, _cosine_rolloff)
+    end
+    cosine_rolloff = reshape(CuArray(Float32.(hcat(cosine_rolloff...))), (:,2,4))
+    γ = cosine_rolloff[:,1,:] .* γ # Roll-off gamma
+    ζ = cosine_rolloff[:,2,:] .* ζ # Roll-off zeta
+    
+    #= We will need to identify outliers in the reference pixels and
+    backfill them with something sensible. To find outliers, it will be
+    helpful to apply a 1/f suppressing filter before using a sigma-clip
+    to identify outliers. Here is that filter. =#
+    w = CuArray(reshape(sqrt.(rfftfreq ./ (5 .+ rfftfreq)), (:,1)))
+    
+    #= JWST can have up to a 4th rank arrays. Always work to 4th rank
+    and drop singleton dimensions later =#
+    if ndims(D) != 4
+       D = reshape(D, (nx,ny,:,1))
+    end
+    _nx,_ny,nz,ni = size(D) # Capture dimensions
+
+    #= ***** BEGIN - Backfill all outliers in left reference columns ***** =#
+    L = irfft(w .* rfft(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
+    μ = median(L)
+    σ = 1.4826median(abs.(L.-μ))
+    GL = (μ-sigrej*σ.<=L) .& (L.<=μ+sigrej*σ)                                        # Good pixel mask
+    L = reshape(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), (ny,:,ni))          # Reload unfiltered L
+    L[.! GL] .= 0                                                                  # Mark outliers by setting them =0.
+    L_fill = irfft(rfft(L, 1) .* fK, 2048, 1) ./ irfft(rfft(GL, 1) .* fK, 2048, 1) # Compute fill values
+    L[.! GL] .= L_fill[.! GL]                                                      # Fill outliers
+    #= ***** END - Backfill all outliers in left reference columns ***** =#
+
+    #= ***** BEGIN - Backfill all outliers in right reference columns ***** =#
+    R = irfft(w .* rfft(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
+    μ = median(R)
+    σ = 1.4826median(abs.(R.-μ))
+    GR = (μ-sigrej*σ.<=R) .& (R.<=μ+sigrej*σ)                                        # Good pixel mask
+    R = reshape(dropdims(mean(D[end-rb+1:end,:,:,:], dims=1), dims=1), (ny,:,ni))   # Reload unfiltered R
+    R[.! GR] .= 0                                                                  # Mark outliers by setting them =0.
+    R_fill = irfft(rfft(R, 1) .* fK, 2048, 1) ./ irfft(rfft(GR, 1) .* fK, 2048, 1) # Compute fill values
+    R[.! GR] .= R_fill[.! GR]                                                      # Fill outliers
+    #= ***** END - Backfill all outliers in left reference columns ***** =#
+
+    # Build the reference array
+    R = irfft(ein"ij,ikl->ijkl"(γ, rfft(L,1)) .+ ein"ij,ikl->ijkl"(ζ, rfft(R,1)), ny, 1)
+    R = reshape(permutedims(R, (2,1,3,4)), (1,nout,ny,:,ni))
+    
+    # Reference correct
+    D = reshape(D, (nx÷nout,nout,ny,:,ni)) .- R
+    
+    # Restore shape
+    D = reshape(D, (nx,ny,nz,ni))
+    
+    # Remove singleton dimensions
+    D = dropdims(D, dims = tuple(findall(size(D) .== 1)...))
+
+    # Done
+    D
+    
+end
