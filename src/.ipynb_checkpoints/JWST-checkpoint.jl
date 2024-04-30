@@ -680,11 +680,13 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
                              # transorm of Gaussian kernel shaped to broadcast.
         
     # Get some necessary information from FITS header
-    detector, ngroups, nints = FITS(fits_filename, "r") do fid
+    detector, ngroups, nints, fastaxis, slowaxis = FITS(fits_filename, "r") do fid
         (
             lowercase(read_key(fid[1], "DETECTOR")[1]),
             read_key(fid[1], "NGROUPS")[1],
-            read_key(fid[1], "NINTS")[1]
+            read_key(fid[1], "NINTS")[1],
+            read_key(fid[1], "FASTAXIS")[1],
+            read_key(fid[1], "SLOWAXIS")[1]
         )
     end
         
@@ -730,6 +732,11 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
        D = reshape(D, (nx,ny,:,1))
     end
     _nx,_ny,nz,ni = size(D) # Capture dimensions
+    
+    #= Translate to detector coordinates. =#
+    if abs(fastaxis) != 1; D = permutedims(D, (2,1,3,4)); end # Make fast axis first
+    if sign(fastaxis) < 0; D = D[end:-1:1,:,:,:]; end # Flip if necessary
+    if sign(slowaxis) < 0; D = D[:,end:-1:1,:,:]; end # Flip if necessary
 
     #= ***** BEGIN - Backfill all outliers in left reference columns ***** =#
     L = irfft(w .* rfft(dropdims(mean(D[1:rb,:,:,:], dims=1), dims=1), 1), ny, 1) # Get ref. cols. and filter 1/f
@@ -762,6 +769,11 @@ function apply_sirs(fits_filename::String; sirs_file::String="", zrng=:, irng=:,
     
     # Restore shape
     D = reshape(D, (nx,ny,nz,ni))
+    
+    # Return to pipeline coordinates
+    if sign(slowaxis) < 0; D = D[:,end:-1:1,:,:]; end # Unflip if necessary
+    if sign(fastaxis) < 0; D = D[end:-1:1,:,:,:]; end # Unflip if necessary
+    if abs(fastaxis) != 1; D = permutedims(D, (2,1,3,4)); end # Put fast axis back where it needs to be
     
     # Remove singleton dimensions
     D = dropdims(D, dims = tuple(findall(size(D) .== 1)...))
