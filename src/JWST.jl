@@ -574,11 +574,6 @@ function nircam_sirs_solve(F::CRFix, nz::Int64, files::Vector{String})
             if sign(fastaxis) < 0; D = D[end:-1:1,:,:]; end # Flip if necessary
             if sign(slowaxis) < 0; D = D[:,end:-1:1,:]; end # Flip if necessary
             
-            #= Commented out to parallel the pipeline.
-            # The Pipeline's rows-only reference correction does not seem
-            # to work properly. This is a stub. The Pipeline needs to be fixed.
-            D = Array(nircam_rowcor(CuArray(D))) =#
-
             # Fix cosmic rays for entire integration
             D = crfix(F, D)
             
