@@ -16,3 +16,6 @@ SIRS is written in Julia. Because python is more widely used in the astronomical
 This revision incorporates suggestions from Chris Willott of Hertzberg Astrophysics
 * Improved rejection of alternating column noise (ACN)
 * Support for operable pixel masks
+
+
+Testing...
