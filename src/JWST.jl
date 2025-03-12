@@ -543,7 +543,7 @@ end
 
 function nircam_sirs_solve(F::CRFix, nz::Int64, files::Vector{String})
     
-    # Get some necessary information form the first file
+    # Get some necessary information from the first file
     nints,ngroups,fastaxis,slowaxis = FITS(files[1], "r") do fid
        (read_key(fid[1], "NINTS")[1],
         read_key(fid[1], "NGROUPS")[1],
